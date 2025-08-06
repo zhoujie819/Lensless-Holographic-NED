@@ -1,0 +1,900 @@
+# -*- coding: utf-8 -*-
+"""
+High-quality, depth-cue-enhanced lensless holographic near-eye displays via pupil optimization
+Author: Jie Zhou
+Affiliation: Sichuan University
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import math
+import numpy as np
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from skimage.metrics import structural_similarity as ssim
+import cv2
+import matplotlib.pyplot as plt
+from torch.nn import functional as F
+from torchvision import models
+import os
+import random
+
+def hologram_to_phase_error_diffusion(H):
+    """
+    将复振幅全息图通过误差扩散编码转换为纯相位全息图，
+    且采用蛇形扫描方式：
+    - 偶数行从左至右扫描
+    - 奇数行从右至左扫描
+    """
+
+    height, width = H.shape
+    H = H / np.max(np.max(abs(H)))
+    error_buffer = np.zeros((height, width), dtype=np.complex128)
+    H_phase = np.zeros_like(H, dtype=np.complex128)
+
+    for y in range(height):
+        # 根据行号决定扫描方向
+        if y % 2 == 0:  # 偶数行：从左到右
+            x_indices = range(width)
+            left_to_right = True
+        else:  # 奇数行：从右到左
+            x_indices = reversed(range(width))
+            left_to_right = False
+
+        for x in x_indices:
+            desired = H[y, x] + error_buffer[y, x]
+            desired_phase = np.angle(desired)
+            output = np.exp(1j * desired_phase)
+            H_phase[y, x] = output
+
+            # 计算误差
+            error = desired - output
+
+            # 根据扫描方向调整误差扩散方向
+            if left_to_right:
+                # Floyd-Steinberg扩散矩阵（传统从左至右）
+                #     *     7/16
+                # 3/16 5/16 1/16 (下一行)
+                if x + 1 < width:
+                    error_buffer[y, x + 1] += error * (7 / 16)
+                if y + 1 < height:
+                    if x > 0:
+                        error_buffer[y + 1, x - 1] += error * (3 / 16)
+                    error_buffer[y + 1, x] += error * (5 / 16)
+                    if x + 1 < width:
+                        error_buffer[y + 1, x + 1] += error * (1 / 16)
+            else:
+                # 当从右向左扫描时，Floyd-Steinberg扩散应镜像左右关系
+                #     7/16    *
+                # 1/16 5/16 3/16 (下一行) （左右对称翻转）
+                if x - 1 >= 0:
+                    error_buffer[y, x - 1] += error * (7 / 16)
+                if y + 1 < height:
+                    if x + 1 < width:
+                        error_buffer[y + 1, x + 1] += error * (3 / 16)
+                    error_buffer[y + 1, x] += error * (5 / 16)
+                    if x - 1 >= 0:
+                        error_buffer[y + 1, x - 1] += error * (1 / 16)
+
+    return H_phase
+
+def double_phase(Uf):
+    # Uf shape: [batch_size, channels, height (N), width (M)]
+    N, M = Uf.shape[-2], Uf.shape[-1]  # Extract height and width
+
+    # Generate coordinate grids
+    x = torch.arange(M, device=Uf.device).reshape(1, M).expand(N, M)
+    y = torch.arange(N, device=Uf.device).reshape(N, 1).expand(N, M)
+
+    # Create Mask1 using cosine squared
+    Mask1 = torch.cos(np.pi * (x + y) / 2).pow(2)
+
+    Mask2 = 1 - Mask1  # Inverse of Mask1
+    Mask1 = 1 - Mask2
+    # print(Mask1,Mask2)
+    # Remove batch and channel dimensions for computation
+    Uf = Uf.squeeze(0).squeeze(0)  # Now Uf has shape [N, M]
+
+    # Compute amplitude and phase
+    Uf_P = torch.angle(Uf)
+    Uf_A = torch.abs(Uf)
+    w = Uf_A / (torch.max(Uf_A)+1e-4)
+
+    # Compute theta1 and theta2
+    theta1 = Uf_P + torch.acos(w)
+    theta2 = Uf_P - torch.acos(w)
+
+    # Combine phases using the masks
+    theta = theta1 * Mask1 + theta2 * Mask2
+
+    # Add batch and channel dimensions back
+    theta = theta.unsqueeze(0).unsqueeze(0)  # Shape: [1, 1, N, M]
+
+    return theta
+
+def blaze(H,b,c):  # 闪耀光栅
+    N, M = np.shape(H)
+    n = np.arange(-N / 2, N / 2)
+    m = np.arange(-M / 2, M / 2)
+    # b = 1
+    # c = 0
+    blaze_phase = np.zeros((N, M))
+    for i1 in range(N):
+        for j1 in range(M):
+            blaze_phase[i1, j1] = 2 * np.pi / 10 * np.mod(b * m[j1] + c * n[i1], 10)
+    return blaze_phase
+# ------------------------- Utility Functions -------------------------
+def clight_generation(u_in, wavelength, feature_size, prop_dist, phase_noise_amplitude=0.0, offset_x=0.0, offset_y=0.0):
+    """
+    生成收敛光场，并在球面波相位中加入随机性。
+
+    参数：
+    - u_in: 输入图像（幅度），形状为 (num_x, num_y)
+    - wavelength: 光的波长
+    - feature_size: 特征尺寸 (dx, dy)
+    - prop_dist: 传播距离
+    - phase_noise_amplitude: 随机相位噪声的幅度，默认值为 0.0 弧度
+    """
+
+    k = 2 * np.pi / wavelength
+
+    # 获取输入图像的分辨率
+    num_x, num_y = u_in.shape
+
+    dx, dy = feature_size
+
+    x = np.linspace(-num_x / 2, num_x / 2, num_x) * dx
+    y = np.linspace(-num_y / 2, num_y / 2, num_y) * dy
+    x, y = np.meshgrid(x, y)  # 使用 'ij' 索引以匹配数组维度
+    # 计算球面波的相位
+    spherical_phase = -1j * k * ((x-offset_x) ** 2 + (y-offset_y) ** 2) / (2 * -prop_dist)
+
+    # 生成随机相位噪声
+    random_phase = phase_noise_amplitude * (np.random.rand(num_x, num_y) * 2 * np.pi - np.pi)
+
+    # 将随机相位转换为复数形式
+    random_phase_complex = np.exp(1j * random_phase)
+
+    # 生成最终的收敛光场
+    c_light = np.exp(spherical_phase) * random_phase_complex
+
+    return c_light
+
+def pading_float32(U):
+    """
+    将输入图像 U 填充为形状 (1080, 1920)。
+    """
+    m, n = U.shape
+    pad = np.zeros((1080, 1920), dtype=np.uint8)
+    pad[1080 // 2 - m // 2:1080 // 2 + m // 2, 1920 // 2 - n // 2:1920 // 2 + n // 2] = U
+    return pad
+
+def polar_to_rect(mag, ang):
+    """
+    将极坐标转换为直角坐标。
+    """
+    real = mag * torch.cos(ang)
+    imag = mag * torch.sin(ang)
+    return real, imag
+
+def ifftshift(tensor):
+    """
+    对张量进行 ifftshift 操作。
+    """
+    size = tensor.size()
+    tensor_shifted = roll_torch(tensor, -math.floor(size[2] / 2.0), 2)
+    tensor_shifted = roll_torch(tensor_shifted, -math.floor(size[3] / 2.0), 3)
+    return tensor_shifted
+
+def fftshift(tensor):
+    """
+    对张量进行 fftshift 操作。
+    """
+    size = tensor.size()
+    tensor_shifted = roll_torch(tensor, math.floor(size[2] / 2.0), 2)
+    tensor_shifted = roll_torch(tensor_shifted, math.floor(size[3] / 2.0), 3)
+    return tensor_shifted
+
+def roll_torch(tensor, shift, axis):
+    """
+    实现 numpy 的 roll() 或 Matlab 的 circshift() 函数。
+    """
+    if shift == 0:
+        return tensor
+
+    if axis < 0:
+        axis += tensor.dim()
+
+    dim_size = tensor.size(axis)
+    shift = shift % dim_size
+    if shift == 0:
+        return tensor
+
+    before = tensor.narrow(axis, 0, dim_size - shift)
+    after = tensor.narrow(axis, dim_size - shift, shift)
+
+    return torch.cat([after, before], axis)
+
+def generate_circular_pupil(image_size, pixel_spacing, diameter_mm):
+    """
+    生成一个中心为圆形的孔径掩膜。
+
+    参数：
+    - image_size: 图像的尺寸 (高度, 宽度)
+    - pixel_spacing: 每个像素的间距（单位：米）
+    - diameter_mm: 圆形孔径的直径（单位：毫米）
+
+    返回：
+    - pupil_mask: 生成的圆形孔径掩膜，形状为 (1, 1, height, width)
+    """
+    height, width = image_size
+    diameter_m = diameter_mm * 1e-3  # 转换为米
+    radius_m = diameter_m / 2
+    radius_px = radius_m / pixel_spacing  # 计算半径对应的像素数
+
+    # 生成网格
+    y = torch.linspace(-height / 2, height / 2, steps=height)
+    x = torch.linspace(-width / 2, width / 2, steps=width)
+    xx, yy = torch.meshgrid(x, y, indexing='ij')  # 使用 'ij' 索引
+    distance = torch.sqrt(xx**2 + yy**2)
+
+    # 生成掩膜
+    pupil_mask = (distance <= radius_px).float()
+    pupil_mask = pupil_mask.unsqueeze(0).unsqueeze(0)  # 形状调整为 (1, 1, height, width)
+    return pupil_mask
+
+def compute_gradient(img):
+    """
+    计算图像的水平和垂直梯度，用于边缘损失。
+    """
+    gradient_h = img[:, :, :, :-1] - img[:, :, :, 1:]
+    gradient_v = img[:, :, :-1, :] - img[:, :, 1:, :]
+    return gradient_h, gradient_v
+
+# ------------------------- Fresnel Diffraction Class -------------------------
+
+class FresnelDiffractionSFFT:
+    def __init__(self, wavelength, prop_dist, feature_size, num_y, num_x, dtype=torch.complex64, device='cpu'):
+        """
+        初始化Fresnel衍射计算器，预计算并缓存pre_chirp和post_chirp。
+
+        参数：
+        - wavelength: 光的波长
+        - prop_dist: 传播距离
+        - feature_size: 采样间距（空间域的采样间距），应为 (dy, dx)
+        - num_y: 输入光场的高度（像素数）
+        - num_x: 输入光场的宽度（像素数）
+        - dtype: 数据类型
+        - device: 设备（'cpu' 或 'cuda'）
+        """
+        self.wavelength = wavelength
+        self.prop_dist = prop_dist
+        self.feature_size = feature_size
+        self.num_y = num_y
+        self.num_x = num_x
+        self.dtype = dtype
+        self.device = device
+
+        dy, dx = feature_size
+        k = 2 * torch.pi / wavelength  # 波数
+
+        # 创建空间网格
+        x = torch.linspace(-num_x / 2, num_x / 2, num_x, device=device) * dx
+        y = torch.linspace(-num_y / 2, num_y / 2, num_y, device=device) * dy
+        x, y = torch.meshgrid(x, y, indexing='ij')  # 使用 'ij' 索引以匹配数组维度
+        x = x.to(dtype=torch.float32)
+        y = y.to(dtype=torch.float32)
+
+        # 预计算pre_chirp
+        pre_phase = k * (x**2 + y**2) / (2 * prop_dist)
+        pre_chirp = torch.exp(1j * pre_phase).unsqueeze(0).unsqueeze(0)  # 形状: (1, 1, num_x, num_y)
+        self.pre_chirp = pre_chirp.type(dtype).to(device)
+
+        # 创建频域网格
+        dfx = wavelength * abs(prop_dist) / (num_x * dx)  # 傅里叶变换后的采样间距
+        dfy = wavelength * abs(prop_dist) / (num_y * dy)
+        fx = torch.linspace(-num_x / 2, num_x / 2, num_x, device=device) * dfx
+        fy = torch.linspace(-num_y / 2, num_y / 2, num_y, device=device) * dfy
+        fx, fy = torch.meshgrid(fx, fy, indexing='ij')
+        fx = fx.to(dtype=torch.float32)
+        fy = fy.to(dtype=torch.float32)
+
+        # 预计算post_chirp
+        post_phase = k * (fx**2 + fy**2) / (2 * prop_dist)
+        post_chirp = torch.exp(1j * post_phase).unsqueeze(0).unsqueeze(0)  # 形状: (1, 1, num_x, num_y)
+        self.post_chirp = post_chirp.type(dtype).to(device)
+
+    def propagate(self, u_in):
+        """
+        计算传播后的菲涅耳衍射场。
+
+        参数：
+        - u_in: 输入复数光场，大小为 (batch, channel, height, width) 的四维张量
+
+        返回：
+        - U_diff: 传播后的衍射场，形状与u_in相同
+        """
+        # 确保输入尺寸匹配
+        assert u_in.shape[-2] == self.num_y and u_in.shape[-1] == self.num_x, \
+            f"Input size ({u_in.shape[-2]}, {u_in.shape[-1]}) does not match initialized size ({self.num_y}, {self.num_x})"
+
+        # 应用pre_chirp相位调制
+        U0_chirp = u_in * self.pre_chirp
+
+        # 进行傅里叶变换
+        if self.prop_dist > 0:
+            U_fft = fftshift(torch.fft.fftn(fftshift(U0_chirp), dim=(-2, -1), norm='ortho'))
+        else:
+            U_fft = ifftshift(torch.fft.ifftn(ifftshift(U0_chirp), dim=(-2, -1), norm='ortho'))
+        # 应用post_chirp相位因子
+        U_diff = U_fft * self.post_chirp
+
+        return U_diff
+
+# ------------------------- Perceptual Loss Class -------------------------
+
+class PerceptualLoss(nn.Module):
+    def __init__(self, resize=True, device='cpu'):
+        super(PerceptualLoss, self).__init__()
+        # 加载预训练的 VGG19 模型
+        vgg19 = models.vgg19(pretrained=True).features.to(device)
+        # 冻结参数
+        for param in vgg19.parameters():
+            param.requires_grad = False
+        self.vgg19 = vgg19.eval()
+        # 定义要提取特征的层
+        self.layers = {
+            '3': 'relu1_2',
+            '8': 'relu2_2',
+            '17': 'relu3_4',
+            '26': 'relu4_4'
+        }
+        self.resize = resize
+        # ImageNet 数据集的标准化参数
+        self.mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1,3,1,1)
+        self.std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1,3,1,1)
+
+    def forward(self, x, y):
+        # x 和 y 是范围在 [0,1] 的图像，大小为 (batch, channels, height, width)
+        if self.resize:
+            x = F.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
+            y = F.interpolate(y, size=(224, 224), mode='bilinear', align_corners=False)
+        # 标准化
+        x = (x - self.mean) / self.std
+        y = (y - self.mean) / self.std
+        # 提取特征
+        x_features = self.extract_features(x)
+        y_features = self.extract_features(y)
+        loss = 0
+        for key in x_features.keys():
+            loss += F.l1_loss(x_features[key], y_features[key])
+        return loss
+
+    def extract_features(self, x):
+        features = {}
+        for name, layer in self.vgg19._modules.items():
+            x = layer(x)
+            if name in self.layers:
+                features[self.layers[name]] = x
+        return features
+
+# ------------------------- Stochastic Gradient Descent Function -------------------------
+
+def stochastic_gradient_descent(
+    init_pupil_amp, init_pupil_phase, target_camp,
+    propagator_pupil_to_object=None,
+    pupil_mask1=None, pupil_mask2=None, pupil_mask3=None,
+    mse_loss=None, ssim_loss=None, perceptual_loss=None,  # 添加感知损失参数
+    loss_weights=None, loss_mask_weights=None,
+    num_iters=1001, lr_pupil_amp=0.02, lr_pupil_phase=0.02, lr_pupil_s=0.02, pupil_s0=1.0):
+    """
+    执行随机梯度下降以优化瞳孔复振幅。
+
+    返回:
+    - s: 缩放因子
+    - pupil_amp: 优化后的瞳孔振幅
+    - pupil_phase: 优化后的瞳孔相位
+    """
+    device = init_pupil_amp.device
+    s = torch.tensor(pupil_s0, requires_grad=True, device=device)
+    # pupil_amp 和 pupil_phase 需要梯度
+    pupil_amp = init_pupil_amp.clone().detach().requires_grad_(True).to(device)
+    pupil_phase = init_pupil_phase.clone().detach().requires_grad_(True).to(device)
+
+    optvars = [
+        {'params': pupil_amp, 'lr': lr_pupil_amp},
+        {'params': pupil_phase, 'lr': lr_pupil_phase},
+        {'params': s, 'lr': lr_pupil_s}
+    ]
+    optimizer = optim.Adam(optvars)
+
+    # 添加学习率调度器，每500次迭代将学习率减半
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=500, gamma=0.5)
+
+    for k in range(num_iters):
+        optimizer.zero_grad()
+
+        real_pupil, imag_pupil = polar_to_rect(pupil_amp, pupil_phase)
+        pupil_complex_field = torch.complex(real_pupil, imag_pupil)
+
+        # 应用瞳孔掩膜
+        pupil_complex_field1 = pupil_complex_field * pupil_mask1
+        pupil_complex_field2 = pupil_complex_field * pupil_mask2
+        pupil_complex_field3 = pupil_complex_field * pupil_mask3
+
+        recon_field1 = propagator_pupil_to_object(u_in=pupil_complex_field1)
+        recon_field2 = propagator_pupil_to_object(u_in=pupil_complex_field2)
+        recon_field3 = propagator_pupil_to_object(u_in=pupil_complex_field3)
+
+        # 计算损失
+        recon_amp1 = recon_field1.abs()
+        recon_amp2 = recon_field2.abs()
+        recon_amp3 = recon_field3.abs()
+
+        tar_amp = target_camp.abs()
+        scaled_recon1 = s * recon_amp1
+        scaled_recon2 = s * recon_amp2
+        scaled_recon3 = s * recon_amp3
+
+        # MSE Loss
+        mse_loss_value1 = mse_loss(scaled_recon1, tar_amp)
+        mse_loss_value2 = mse_loss(scaled_recon2, tar_amp)
+        mse_loss_value3 = mse_loss(scaled_recon3, tar_amp)
+
+        mse_loss_value = (loss_mask_weights['mask1'] * mse_loss_value1 +
+                          loss_mask_weights['mask2'] * mse_loss_value2 +
+                          loss_mask_weights['mask3'] * mse_loss_value3
+                          )
+        # SSIM Loss
+        scaled_recon_gray1 = scaled_recon1 / (scaled_recon1.max() + 1e-8)
+        scaled_recon_gray2 = scaled_recon2 / (scaled_recon2.max() + 1e-8)
+        scaled_recon_gray3 = scaled_recon3 / (scaled_recon3.max() + 1e-8)
+
+        tar_amp_gray = tar_amp / (tar_amp.max() + 1e-8)
+
+        ssim_loss_value1 = 1 - ssim_loss(scaled_recon_gray1, tar_amp_gray)
+        ssim_loss_value2 = 1 - ssim_loss(scaled_recon_gray2, tar_amp_gray)
+        ssim_loss_value3 = 1 - ssim_loss(scaled_recon_gray3, tar_amp_gray)
+
+        ssim_loss_value = (loss_mask_weights['mask1'] * ssim_loss_value1 +
+                           loss_mask_weights['mask2'] * ssim_loss_value2 +
+                           loss_mask_weights['mask3'] * ssim_loss_value3
+                           )
+
+        # 边缘损失
+        recon_grad_h1, recon_grad_v1 = compute_gradient(scaled_recon_gray1)
+        recon_grad_h2, recon_grad_v2 = compute_gradient(scaled_recon_gray2)
+        recon_grad_h3, recon_grad_v3 = compute_gradient(scaled_recon_gray3)
+
+        tar_grad_h, tar_grad_v = compute_gradient(tar_amp_gray)
+
+        edge_loss_value1 = mse_loss(recon_grad_h1, tar_grad_h) + mse_loss(recon_grad_v1, tar_grad_v)
+        edge_loss_value2 = mse_loss(recon_grad_h2, tar_grad_h) + mse_loss(recon_grad_v2, tar_grad_v)
+        edge_loss_value3 = mse_loss(recon_grad_h3, tar_grad_h) + mse_loss(recon_grad_v3, tar_grad_v)
+
+
+        edge_loss_value = (loss_mask_weights['mask1'] * edge_loss_value1 +
+                           loss_mask_weights['mask2'] * edge_loss_value2 +
+                           loss_mask_weights['mask3'] * edge_loss_value3
+                           )
+        # 总损失
+        total_loss = (loss_weights['mse'] * mse_loss_value +
+                      loss_weights['ssim'] * ssim_loss_value +
+                      loss_weights['edge'] * edge_loss_value)
+
+        total_loss.backward()
+        optimizer.step()
+        scheduler.step()  # 更新学习率
+
+    return pupil_amp, pupil_phase
+
+# ------------------------- SGD Optimization Class -------------------------
+
+class SGD(nn.Module):
+    def __init__(
+        self,
+        propagator_pupil_to_object=None,
+        pupil_mask1=None,
+        pupil_mask2=None,
+        pupil_mask3=None,
+        loss_weights=None,
+        loss_mask_weights=None,
+        num_iters=None,
+        lr_pupil_amp=0.01,
+        lr_pupil_phase=0.01,
+        lr_pupil_s=0.003,
+        pupil_s0=1.0,
+        device=torch.device('cuda')
+    ):
+        """
+        初始化SGD优化模型。
+        """
+        super(SGD, self).__init__()
+        # 设置参数
+        self.propagator_pupil_to_object = propagator_pupil_to_object
+        self.pupil_mask1 = pupil_mask1
+        self.pupil_mask2 = pupil_mask2
+        self.pupil_mask3 = pupil_mask3
+        self.loss_weights=loss_weights,
+        self.loss_mask_weights=loss_mask_weights,
+        self.num_iters = num_iters
+        self.lr_pupil_amp = lr_pupil_amp
+        self.lr_pupil_phase = lr_pupil_phase
+        self.lr_pupil_s = lr_pupil_s
+        self.pupil_s0 = pupil_s0
+        self.dev = device
+
+        self.num_y = propagator_pupil_to_object.num_y
+        self.num_x = propagator_pupil_to_object.num_x
+
+        # 损失函数权重，添加边缘损失
+        if loss_mask_weights is None:
+            self.loss_mask_weights = {'mask1': 1.0, 'mask2': 1.0, 'mask3': 1.0, 'mask6': 1.0, 'mask7': 1.0}
+        else:
+            self.loss_mask_weights = loss_mask_weights
+
+        if loss_weights is None:
+            self.loss_weights = {'mse': 0.95, 'ssim': 0.05, 'edge': 0.0}
+        else:
+            self.loss_weights = loss_weights
+
+        # SSIM 损失函数
+        try:
+            from pytorch_msssim import SSIM
+            self.ssim_loss = SSIM(data_range=1.0, size_average=True, channel=1).to(device)
+        except ImportError:
+            raise ImportError("Please install pytorch_msssim to use SSIM loss.")
+
+        # 均方误差损失
+        self.mse_loss = nn.MSELoss().to(device)
+
+        # 感知损失
+        self.perceptual_loss = PerceptualLoss(device=device).to(device)
+
+    def forward(self, target_camp=None, init_pupil_amp=None, init_pupil_phase=None):
+        """
+        执行SGD优化的前向传播。
+        """
+        if init_pupil_amp is None:
+            init_pupil_amp = torch.rand(1, 1, self.num_y, self.num_x, device=self.dev)
+        if init_pupil_phase is None:
+            init_pupil_phase = (-0.5 + torch.rand(1, 1, self.num_y, self.num_x, device=self.dev)) * 2 * np.pi
+
+        final_pupil_amp, final_pupil_phase = stochastic_gradient_descent(
+            init_pupil_amp, init_pupil_phase, target_camp,
+            propagator_pupil_to_object=self.propagator_pupil_to_object.propagate,
+            pupil_mask1=self.pupil_mask1,
+            pupil_mask2=self.pupil_mask2,
+            pupil_mask3=self.pupil_mask3,
+            mse_loss=self.mse_loss,
+            ssim_loss=self.ssim_loss,
+            perceptual_loss=self.perceptual_loss,  # 添加感知损失参数
+            loss_weights=self.loss_weights,
+            loss_mask_weights=self.loss_mask_weights,
+            num_iters=self.num_iters,
+            lr_pupil_amp=self.lr_pupil_amp,
+            lr_pupil_phase=self.lr_pupil_phase,
+            lr_pupil_s=self.lr_pupil_s,
+            pupil_s0=self.pupil_s0,
+        )
+        return final_pupil_amp, final_pupil_phase
+
+# ------------------------- Optimize SLM Phase Class -------------------------
+class OptimizeSLMPhase(nn.Module):
+    def __init__(
+        self,
+        propagator_hologram_to_pupil=None,
+        pupil_mask3=None,
+        num_iters=1001,
+        lr_slm_phase=0.02,
+        lr_slm_s=0.02,
+        slm_s0=1.0,
+    ):
+
+        super(OptimizeSLMPhase, self).__init__()
+        # 设置参数
+        self.propagator_hologram_to_pupil = propagator_hologram_to_pupil
+        self.pupil_mask3 = pupil_mask3
+        self.num_iters = num_iters
+        self.lr_slm_phase = lr_slm_phase
+        self.lr_slm_s = lr_slm_s
+        self.slm_s0 = slm_s0
+
+    def forward(self, pupil_complex_field=None, init_slm_phase=None):
+        optimized_slm_phase = optimize_slm_phase(
+            pupil_complex_field,init_slm_phase,
+            propagator_hologram_to_pupil=self.propagator_hologram_to_pupil.propagate,
+            pupil_mask3=self.pupil_mask3,
+            num_iters=self.num_iters,
+            lr_slm_phase=self.lr_slm_phase,
+            lr_slm_s=self.lr_slm_s,
+            slm_s0=self.slm_s0,
+        )
+        return optimized_slm_phase
+
+# ------------------------- Optimize SLM Phase Function -------------------------
+
+def optimize_slm_phase(
+    pupil_complex_field, init_slm_phase,
+    propagator_hologram_to_pupil,
+    pupil_mask3,
+    num_iters,
+    lr_slm_phase,
+    lr_slm_s,
+    slm_s0,
+):
+
+    device = init_slm_phase.device
+    s = torch.tensor(slm_s0, requires_grad=True, device=device)
+    pupil_complex_field = pupil_complex_field.clone().detach()
+    slm_phase = init_slm_phase.clone().detach().requires_grad_(True).to(device)
+
+    # 定义优化器，优化 slm_phase 和 s
+    optimizer = optim.Adam([
+        {'params': slm_phase, 'lr': lr_slm_phase},
+        {'params': s, 'lr': lr_slm_s}
+    ])
+
+    # 定义损失函数
+    mse_loss = nn.MSELoss().to(device)
+
+    for k in range(num_iters):
+        optimizer.zero_grad()
+
+        # 将 slm_phase 转换为复振幅场（振幅为1）
+        real, imag = polar_to_rect(torch.ones_like(slm_phase), slm_phase)
+        slm_field = torch.complex(real, imag)
+
+        # 传播 slm_phase 通过 propagator5 得到 recon_pupil_complex_field
+        recon_pupil_complex_field = propagator_hologram_to_pupil(slm_field)
+
+        # 提取振幅和相位
+
+        recon_real, recon_imag = polar_to_rect(recon_pupil_complex_field.abs(), recon_pupil_complex_field.angle())
+        tar_real, tar_imag = polar_to_rect(pupil_complex_field.abs(), pupil_complex_field.angle())
+
+
+        # 计算振幅和相位的 MSE 损失
+        real_loss = mse_loss(s * recon_real * pupil_mask3, tar_real * pupil_mask3)
+        imag_loss = mse_loss(s * recon_imag * pupil_mask3, tar_imag * pupil_mask3)
+
+        # 总损失
+        total_loss = real_loss + imag_loss
+
+        total_loss.backward()
+        optimizer.step()
+
+    return slm_phase
+
+# ------------------------- Main Execution Code -------------------------
+
+if __name__ == "__main__":
+    # ------------------------------------------
+    # 1. Unit Definitions
+    # ------------------------------------------
+    cm, mm, um, nm = 1e-2, 1e-3, 1e-6, 1e-9
+
+    # ------------------------------------------
+    # 2. Optical Setup Parameters
+    # ------------------------------------------
+    # Two-stage propagation distances
+    prop_dist1 = 80 * mm           # Object → intermediate pupil plane
+    prop_dist2 = 140 * mm          # Intermediate pupil → hologram plane
+
+    # Laser wavelength and SLM pixel pitch
+    wavelength   = 671 * nm        # 671 nm (e.g. red laser diode)
+    slm_pitch    = 8   * um        # 8 µm SLM pixel spacing
+
+    # Calculate the corresponding pupil and target plane sampling pitches
+    pupil_pitch  = wavelength * prop_dist2 / (1080 * slm_pitch)
+    target_pitch = slm_pitch * (prop_dist2 + prop_dist1) / prop_dist2
+
+    # Feature‐size tuples for propagators
+    slm_feature_size    = (slm_pitch,    slm_pitch)
+    pupil_feature_size  = (pupil_pitch,  pupil_pitch)
+    target_feature_size = (target_pitch, target_pitch)
+
+    # Resolution and wave number
+    image_res = (1080, 1080)        # H × W (pixels)
+    k = 2 * np.pi / wavelength     # Wave number
+
+    # ------------------------------------------
+    # 3. Training Hyperparameters
+    # ------------------------------------------
+    dtype = torch.float32
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    num_iters      = 1001          # Number of gradient steps
+
+    # Learning rates for pupil‐plane optimization
+    lr_pupil_amp   = 0.02
+    lr_pupil_phase = 0.02
+    lr_pupil_s     = 0.02
+    pupil_s0       = 1.0           # Initial scaling factor
+
+    # Loss weights (must sum to 1 or be balanced accordingly)
+    loss_weights = {
+        'mse':  0.95,  # Mean‐squared amplitude error
+        'ssim': 0.05,  # Structural similarity penalty
+        'edge': 0.00   # (Optional) edge gradient penalty
+    }
+
+    # Learning rates for SLM‐phase optimization
+    lr_slm_phase = 0.02
+    lr_slm_s     = 0.02
+    slm_s0       = 1.0
+
+    # ------------------------------------------
+    # 4. Build Circular Pupil Masks
+    # ------------------------------------------
+    # Create three concentric circular apertures of varying diameters (in mm)
+    pupil_mask1 = generate_circular_pupil(image_res, pupil_pitch, diameter_mm=2.0).to(device)
+    pupil_mask2 = generate_circular_pupil(image_res, pupil_pitch, diameter_mm=3.0).to(device)
+    pupil_mask3 = generate_circular_pupil(image_res, pupil_pitch, diameter_mm=4.0).to(device)
+
+    # Extra masks for deeper defocus testing
+    pupil_mask4 = generate_circular_pupil(image_res, pupil_pitch, diameter_mm=2.5).to(device)
+    pupil_mask5 = generate_circular_pupil(image_res, pupil_pitch, diameter_mm=3.5).to(device)
+
+    # All pupil masks equally weighted
+    loss_mask_weights = {'mask1': 1.0, 'mask2': 1.0, 'mask3': 1.0}
+
+    # ------------------------------------------
+    # 5. Initialize Fresnel Propagators
+    # ------------------------------------------
+    # Object → pupil plane (negative distance for backward propagation)
+    propagator_obj2pupil = FresnelDiffractionSFFT(
+        wavelength, -(prop_dist1 + prop_dist2),
+        target_feature_size, *image_res, device=device
+    )
+
+    # Pupil → object plane (forward propagation)
+    propagator_pupil2obj = FresnelDiffractionSFFT(
+        wavelength,  (prop_dist1 + prop_dist2),
+        pupil_feature_size, *image_res, device=device
+    )
+
+    # Slight defocus variations
+    propagator_pupil2obj_defocus_neg = FresnelDiffractionSFFT(
+        wavelength,  (prop_dist1 + prop_dist2 - 20*mm),
+        pupil_feature_size, *image_res, device=device
+    )
+    propagator_pupil2obj_defocus_pos = FresnelDiffractionSFFT(
+        wavelength,  (prop_dist1 + prop_dist2 + 20*mm),
+        pupil_feature_size, *image_res, device=device
+    )
+
+    # Pupil → hologram plane
+    propagator_pupil2holo = FresnelDiffractionSFFT(
+        wavelength, prop_dist2,
+        pupil_feature_size, *image_res, device=device
+    )
+
+    # Hologram → pupil plane (inverse)
+    propagator_holo2pupil = FresnelDiffractionSFFT(
+        wavelength, -prop_dist2,
+        slm_feature_size, *image_res, device=device
+    )
+
+    # ------------------------------------------
+    # 6. Process & Optimize Each Target Image
+    # ------------------------------------------
+    # Example: process only image #886
+    for idx in range(886, 887):
+        print(f"Processing image #{idx}")
+
+        # Build zero-padded filename
+        name = f"{idx:04d}"
+
+        # Load, resize, and grayscale-convert target
+        img_path = f"E:/dataset/valid/{name}.png"
+        img_bgr  = cv2.imread(img_path)
+        if img_bgr is None:
+            raise FileNotFoundError(f"Cannot open {img_path}")
+        img_bgr = cv2.resize(img_bgr, image_res[::-1])  # cv2 uses (W,H)
+        target_amp = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+        # Generate converging wave with optional noise
+        c_light = clight_generation(
+            target_amp, wavelength, target_feature_size,
+            prop_dist1+prop_dist2, offset_x=0.0, offset_y=0.0
+        )
+
+        # Form complex target field and normalize
+        target_complex = (target_amp / 255.0) * c_light
+        target_camp = torch.tensor(
+            target_complex[np.newaxis, np.newaxis, ...],
+            dtype=torch.complex64, device=device
+        )
+
+        # ---------------------------
+        # 6a. Pupil‐plane Optimization
+        # ---------------------------
+        # Back-propagate to get initial pupil complex field
+        init_pupil = propagator_obj2pupil.propagate(target_camp)
+        init_pupil_amp  = init_pupil.abs()
+        init_pupil_phase  = init_pupil.angle()
+
+        # Configure and run SGD optimizer
+        sgd = SGD(
+            propagator_pupil2obj, pupil_mask1, pupil_mask2, pupil_mask3,
+            loss_weights=loss_weights, loss_mask_weights=loss_mask_weights,
+            num_iters=num_iters,
+            lr_pupil_amp=lr_pupil_amp,
+            lr_pupil_phase=lr_pupil_phase,
+            lr_pupil_s=lr_pupil_s,
+            pupil_s0=pupil_s0,
+            device=device
+        )
+
+        print("→ Optimizing pupil complex amplitude...")
+        opt_amp, opt_phase = sgd(
+            target_camp=target_camp,
+            init_pupil_amp=init_pupil_amp,
+            init_pupil_phase=init_pupil_phase,
+        )
+
+
+        real_p, imag_p = polar_to_rect(opt_amp, opt_phase)
+        optimized_pupil_field = torch.complex(real_p, imag_p)
+
+        # ---------------------------
+        # 6b. SLM‐phase Optimization
+        # ---------------------------
+        print("→ Optimizing SLM phase pattern...")
+        slm_optimizer = OptimizeSLMPhase(
+            propagator_holo2pupil, pupil_mask3,
+            num_iters=num_iters,
+            lr_slm_phase=lr_slm_phase,
+            lr_slm_s=lr_slm_s,
+            slm_s0=slm_s0
+        ).to(device)
+
+        # Random initial SLM phase
+        init_slm = ((torch.rand(1,1,*image_res, device=device)-0.5)*2*np.pi)
+        optimized_slm_phase = slm_optimizer(
+            pupil_complex_field=optimized_pupil_field,
+            init_slm_phase=init_slm
+        )
+
+        # ---------------------------
+        # 6c. Reconstruction & Metrics
+        # ---------------------------
+        # Build complex SLM field and back‐propagate to pupil
+        r, i = polar_to_rect(torch.ones_like(optimized_slm_phase), optimized_slm_phase)
+        slm_field = torch.complex(r, i)
+        recon_pupil = propagator_holo2pupil.propagate(slm_field)
+
+        # Apply all masks
+        pupil_fields = [
+            recon_pupil * m for m in
+            (pupil_mask1, pupil_mask2, pupil_mask3, pupil_mask4, pupil_mask5)
+        ]
+        # Include defocused cases
+        pupil_fields += [
+            recon_pupil * pupil_mask1,  # defocus_neg
+            recon_pupil * pupil_mask2   # defocus_pos
+        ]
+
+        # Forward‐propagate each to object plane
+        recon_fields = [
+            propagator_pupil2obj.propagate(u_in=pf) for pf in pupil_fields[:5]
+        ] + [
+            propagator_pupil2obj_defocus_neg.propagate(u_in=pupil_fields[5]),
+            propagator_pupil2obj_defocus_pos.propagate(u_in=pupil_fields[6])
+        ]
+
+        # Compute normalized amplitude and PSNR/SSIM
+        metrics = []
+        target_norm = (target_camp.abs().cpu().numpy()[0,0] /
+                       (target_camp.abs().max().item()+1e-8))
+        for rf in recon_fields:
+            amp = rf.abs().cpu().detach().numpy()[0,0]
+            amp_norm = amp / (amp.max()+1e-8)
+            ps  = psnr(target_norm, amp_norm, data_range=1)
+            ss  = ssim(target_norm, amp_norm, data_range=1)
+            metrics.append((ps, ss))
+
+        # Print results
+        labels = ["2 mm","3 mm","4 mm","2.5 mm","3.5 mm","defocus −20 mm","defocus +20 mm"]
+        for lbl,(p, s) in zip(labels, metrics):
+            print(f"PSNR_{lbl}: {p:.2f},  SSIM_{lbl}: {s:.4f}")
